@@ -752,40 +752,47 @@ async def reprocess_from_url(body: dict):
 
 
 @app.post('/rerank')
-async def rerank(body: dict):
+async def rerank(
+    image: UploadFile = File(...),
+    candidates: str = Form(...),
+    top_k: int = Form(30),
+    use_orb: bool = Form(True),
+):
     """Second-stage visual reranking (SSIM + ORB).
 
-    Request JSON:
-      {
-        "query_image": "<base64 or dataURL>",
-        "candidates": [{"record_id": "...", "logo_url": "..."}, ...],
-        "top_k": 30,
-        "use_orb": true
-      }
+    **This endpoint is designed to match v0 exactly.**
+
+    Request (multipart/form-data):
+      - image: file (query logo)
+      - candidates: JSON string: [{"record_id": "...", "logo_url": "..."}, ...]
+      - top_k: int (optional, default 30)
+      - use_orb: bool (optional, default true)
 
     Response JSON:
       {"ok": true, "results": [{"record_id":..., "ssim_score":..., "orb_score":...}, ...]}
     """
     try:
-        query_b64 = body.get('query_image', '')
-        candidates = body.get('candidates', []) or []
-        top_k = int(body.get('top_k', 30) or 30)
-        use_orb = bool(body.get('use_orb', True))
-        if not query_b64 or not isinstance(candidates, list) or not candidates:
+        import json
+
+        query_bytes = await image.read()
+        cand_list = json.loads(candidates)
+
+        if not query_bytes or not isinstance(cand_list, list) or not cand_list:
             return fastapi.responses.JSONResponse(
-                content={'ok': False, 'error': 'query_image and candidates are required'},
+                content={'ok': False, 'error': 'image and candidates are required'},
                 status_code=400,
             )
 
-        query_bytes = _decode_b64_image(query_b64)
-        # SSIM uses small grayscale
+        # Clamp top_k
+        top_k = max(1, min(int(top_k or 30), 60))
+        use_orb = bool(use_orb)
+
+        # Precompute query grays
         q_gray_64 = _load_gray(query_bytes, 64)
-        # ORB uses larger grayscale
         q_gray_256 = _load_gray(query_bytes, 256) if use_orb else None
 
-        results = []
-        # limit
-        candidates = candidates[:max(1, min(top_k, 60))]
+        # Limit candidates
+        cand_list = cand_list[:top_k]
 
         def work(c: dict):
             rid = str(c.get('record_id', '') or '')
@@ -804,15 +811,17 @@ async def rerank(body: dict):
             except Exception as exc:
                 return {'record_id': rid, 'ssim_score': 0.0, 'orb_score': 0.0, 'error': str(exc)}
 
-        # run in parallel (safe for I/O)
+        results = []
         max_workers = int(os.environ.get('RERANK_WORKERS', '6'))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            for out in ex.map(work, candidates):
+            for out in ex.map(work, cand_list):
                 results.append(out)
 
         return fastapi.responses.JSONResponse(content={'ok': True, 'results': results})
+
     except Exception as exc:
         return fastapi.responses.JSONResponse(
             content={'ok': False, 'error': str(exc)},
             status_code=500,
         )
+
