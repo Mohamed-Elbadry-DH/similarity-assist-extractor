@@ -11,8 +11,10 @@ import io
 import os
 import re
 import tempfile
+import base64
 import unicodedata
 from typing import Iterable, List, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import fastapi
@@ -20,6 +22,7 @@ import fastapi.middleware.cors
 import fastapi.responses
 import numpy as np
 import pytesseract
+import requests
 from fastapi import File, Form, UploadFile
 from PIL import Image, ImageOps
 from pytesseract import Output
@@ -543,6 +546,89 @@ def extract_full_features(
 
 
 # ---------------------------------------------------------------------------
+# Visual reranking helpers (SSIM + ORB)
+# ---------------------------------------------------------------------------
+
+def _decode_b64_image(b64: str) -> bytes:
+    # supports raw base64 or data URLs
+    if not b64:
+        return b''
+    b64 = str(b64).strip()
+    if b64.startswith('data:') and ',' in b64:
+        b64 = b64.split(',', 1)[1]
+    return base64.b64decode(b64)
+
+
+def _load_gray(img_bytes: bytes, size: int) -> np.ndarray:
+    """Load bytes → grayscale uint8 resized to (size,size)."""
+    im = Image.open(io.BytesIO(img_bytes))
+    im = ImageOps.exif_transpose(im)
+    im = im.convert('RGB').resize((size, size), Image.Resampling.LANCZOS)
+    arr = np.array(im)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    return gray
+
+
+def _ssim_score(img1: np.ndarray, img2: np.ndarray) -> float:
+    """Standard SSIM (mean SSIM over full image) using Gaussian window."""
+    # Ensure float64
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+
+    # Constants (for 8-bit images)
+    L = 255.0
+    C1 = (0.01 * L) ** 2
+    C2 = (0.03 * L) ** 2
+
+    mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
+    mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
+
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = cv2.GaussianBlur(img1 * img1, (11, 11), 1.5) - mu1_sq
+    sigma2_sq = cv2.GaussianBlur(img2 * img2, (11, 11), 1.5) - mu2_sq
+    sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    score = float(np.mean(ssim_map))
+    # clamp
+    if score < 0:
+        score = 0.0
+    if score > 1:
+        score = 1.0
+    return round(score, 6)
+
+
+def _orb_score(gray1: np.ndarray, gray2: np.ndarray) -> float:
+    """ORB keypoint matching score in [0,1]."""
+    orb = cv2.ORB_create(nfeatures=600)
+    kp1, des1 = orb.detectAndCompute(gray1, None)
+    kp2, des2 = orb.detectAndCompute(gray2, None)
+    if des1 is None or des2 is None or not kp1 or not kp2:
+        return 0.0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    if not matches:
+        return 0.0
+    matches.sort(key=lambda m: m.distance)
+    # "good" matches threshold (tuned)
+    good = [m for m in matches if m.distance < 60]
+    denom = max(20, min(len(kp1), len(kp2)))
+    score = len(good) / float(denom)
+    if score > 1:
+        score = 1.0
+    return round(float(score), 6)
+
+
+def _fetch_url_bytes(url: str, timeout: int = 10) -> bytes:
+    resp = requests.get(url, timeout=timeout, headers={'User-Agent': 'SimilarityAssistExtractor/1.0'})
+    resp.raise_for_status()
+    return resp.content
+
+
+# ---------------------------------------------------------------------------
 # Routes (Vercel strips /api/extract prefix automatically)
 # ---------------------------------------------------------------------------
 
@@ -658,6 +744,73 @@ async def reprocess_from_url(body: dict):
             ocr_enabled=do_ocr,
         )
         return fastapi.responses.JSONResponse(content={'features': features, 'ok': True})
+    except Exception as exc:
+        return fastapi.responses.JSONResponse(
+            content={'ok': False, 'error': str(exc)},
+            status_code=500,
+        )
+
+
+@app.post('/rerank')
+async def rerank(body: dict):
+    """Second-stage visual reranking (SSIM + ORB).
+
+    Request JSON:
+      {
+        "query_image": "<base64 or dataURL>",
+        "candidates": [{"record_id": "...", "logo_url": "..."}, ...],
+        "top_k": 30,
+        "use_orb": true
+      }
+
+    Response JSON:
+      {"ok": true, "results": [{"record_id":..., "ssim_score":..., "orb_score":...}, ...]}
+    """
+    try:
+        query_b64 = body.get('query_image', '')
+        candidates = body.get('candidates', []) or []
+        top_k = int(body.get('top_k', 30) or 30)
+        use_orb = bool(body.get('use_orb', True))
+        if not query_b64 or not isinstance(candidates, list) or not candidates:
+            return fastapi.responses.JSONResponse(
+                content={'ok': False, 'error': 'query_image and candidates are required'},
+                status_code=400,
+            )
+
+        query_bytes = _decode_b64_image(query_b64)
+        # SSIM uses small grayscale
+        q_gray_64 = _load_gray(query_bytes, 64)
+        # ORB uses larger grayscale
+        q_gray_256 = _load_gray(query_bytes, 256) if use_orb else None
+
+        results = []
+        # limit
+        candidates = candidates[:max(1, min(top_k, 60))]
+
+        def work(c: dict):
+            rid = str(c.get('record_id', '') or '')
+            url = str(c.get('logo_url', '') or '')
+            if not rid or not url:
+                return {'record_id': rid, 'ssim_score': 0.0, 'orb_score': 0.0, 'error': 'missing record_id or logo_url'}
+            try:
+                img_bytes = _fetch_url_bytes(url, timeout=12)
+                c_gray_64 = _load_gray(img_bytes, 64)
+                ssim = _ssim_score(q_gray_64, c_gray_64)
+                orb = 0.0
+                if use_orb and q_gray_256 is not None:
+                    c_gray_256 = _load_gray(img_bytes, 256)
+                    orb = _orb_score(q_gray_256, c_gray_256)
+                return {'record_id': rid, 'ssim_score': ssim, 'orb_score': orb}
+            except Exception as exc:
+                return {'record_id': rid, 'ssim_score': 0.0, 'orb_score': 0.0, 'error': str(exc)}
+
+        # run in parallel (safe for I/O)
+        max_workers = int(os.environ.get('RERANK_WORKERS', '6'))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for out in ex.map(work, candidates):
+                results.append(out)
+
+        return fastapi.responses.JSONResponse(content={'ok': True, 'results': results})
     except Exception as exc:
         return fastapi.responses.JSONResponse(
             content={'ok': False, 'error': str(exc)},
