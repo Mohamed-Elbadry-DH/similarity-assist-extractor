@@ -754,7 +754,7 @@ async def reprocess_from_url(body: dict):
 @app.post('/rerank')
 async def rerank_candidates(
     image: UploadFile = File(...),
-    candidates: str = Form(...),  # JSON: [{record_id, logo_url}, ...]
+    candidates: str = Form(...),
 ):
     """
     Visual reranker — AXIS 2.
@@ -764,7 +764,6 @@ async def rerank_candidates(
     - does NOT use 0/0 as fake evidence
     - prepares logos in a whitespace-aware, aspect-preserving way
     """
-
     import json
     import urllib.request
 
@@ -775,14 +774,11 @@ async def rerank_candidates(
     def _prepare(img_bytes: bytes) -> np.ndarray:
         img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
 
-        # Composite on white background
         bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
         bg.paste(img, mask=img.split()[3] if img.mode == 'RGBA' else None)
         gray = bg.convert('L')
 
         arr = np.array(gray)
-
-        # Trim near-white borders
         mask = arr < 245
         if mask.any():
             rows = np.any(mask, axis=1)
@@ -800,7 +796,6 @@ async def rerank_candidates(
 
             gray = gray.crop((c0, r0, c1 + 1, r1 + 1))
 
-        # Preserve aspect ratio inside square canvas
         contained = ImageOps.contain(gray, THUMB_SIZE, Image.Resampling.LANCZOS)
         canvas = Image.new('L', THUMB_SIZE, 255)
         x = (THUMB_SIZE[0] - contained.size[0]) // 2
@@ -857,7 +852,6 @@ async def rerank_candidates(
             cand_arr = _prepare(cand_bytes)
             cand_u8 = cand_arr.astype(np.uint8)
 
-            # SSIM
             C1, C2 = 6.5025, 58.5225
             mu_q = cv2.GaussianBlur(query_arr, (11, 11), 1.5)
             mu_c = cv2.GaussianBlur(cand_arr, (11, 11), 1.5)
@@ -875,7 +869,6 @@ async def rerank_candidates(
             ssim_map = num / (den + 1e-10)
             ssim_score = float(np.clip(ssim_map.mean(), 0.0, 1.0))
 
-            # ORB
             orb_score = None
             if query_desc is not None and len(query_desc) > 0:
                 _, cand_desc = orb.detectAndCompute(cand_u8, None)
@@ -893,10 +886,9 @@ async def rerank_candidates(
                     if max_possible > 0:
                         orb_score = float(np.clip(len(good) / max_possible, 0.0, 1.0))
 
-            usable = True
             results.append({
                 'record_id': record_id,
-                'usable': usable,
+                'usable': True,
                 'ssim_score': ssim_score,
                 'orb_score': orb_score,
             })
@@ -911,10 +903,4 @@ async def rerank_candidates(
             })
 
     return fastapi.responses.JSONResponse(content={'ok': True, 'results': results})
-    
-    except Exception as exc:
-        return fastapi.responses.JSONResponse(
-            content={'ok': False, 'error': str(exc)},
-            status_code=500,
-        )
 
