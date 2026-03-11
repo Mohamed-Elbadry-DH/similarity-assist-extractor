@@ -752,73 +752,166 @@ async def reprocess_from_url(body: dict):
 
 
 @app.post('/rerank')
-async def rerank(
+async def rerank_candidates(
     image: UploadFile = File(...),
-    candidates: str = Form(...),
-    top_k: int = Form(30),
-    use_orb: bool = Form(True),
+    candidates: str = Form(...),  # JSON: [{record_id, logo_url}, ...]
 ):
-    """Second-stage visual reranking (SSIM + ORB).
-
-    **This endpoint is designed to match v0 exactly.**
-
-    Request (multipart/form-data):
-      - image: file (query logo)
-      - candidates: JSON string: [{"record_id": "...", "logo_url": "..."}, ...]
-      - top_k: int (optional, default 30)
-      - use_orb: bool (optional, default true)
-
-    Response JSON:
-      {"ok": true, "results": [{"record_id":..., "ssim_score":..., "orb_score":...}, ...]}
     """
+    Visual reranker — AXIS 2.
+
+    Important behavior:
+    - returns usable=False for invalid/unusable comparisons
+    - does NOT use 0/0 as fake evidence
+    - prepares logos in a whitespace-aware, aspect-preserving way
+    """
+
+    import json
+    import urllib.request
+
+    THUMB_SIZE = (160, 160)
+    ORB_MAX_FEATURES = 1200
+    ORB_MATCH_RATIO = 0.75
+
+    def _prepare(img_bytes: bytes) -> np.ndarray:
+        img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
+
+        # Composite on white background
+        bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
+        bg.paste(img, mask=img.split()[3] if img.mode == 'RGBA' else None)
+        gray = bg.convert('L')
+
+        arr = np.array(gray)
+
+        # Trim near-white borders
+        mask = arr < 245
+        if mask.any():
+            rows = np.any(mask, axis=1)
+            cols = np.any(mask, axis=0)
+            r0, r1 = np.where(rows)[0][[0, -1]]
+            c0, c1 = np.where(cols)[0][[0, -1]]
+
+            pad_r = max(2, int((r1 - r0 + 1) * 0.06))
+            pad_c = max(2, int((c1 - c0 + 1) * 0.06))
+
+            r0 = max(0, r0 - pad_r)
+            r1 = min(arr.shape[0] - 1, r1 + pad_r)
+            c0 = max(0, c0 - pad_c)
+            c1 = min(arr.shape[1] - 1, c1 + pad_c)
+
+            gray = gray.crop((c0, r0, c1 + 1, r1 + 1))
+
+        # Preserve aspect ratio inside square canvas
+        contained = ImageOps.contain(gray, THUMB_SIZE, Image.Resampling.LANCZOS)
+        canvas = Image.new('L', THUMB_SIZE, 255)
+        x = (THUMB_SIZE[0] - contained.size[0]) // 2
+        y = (THUMB_SIZE[1] - contained.size[1]) // 2
+        canvas.paste(contained, (x, y))
+
+        return np.array(canvas, dtype=np.float32)
+
+    query_bytes = await image.read()
     try:
-        import json
+        query_arr = _prepare(query_bytes)
+    except Exception as exc:
+        return fastapi.responses.JSONResponse(
+            content={'ok': False, 'error': f'Cannot decode query image: {exc}'},
+            status_code=400,
+        )
 
-        query_bytes = await image.read()
-        cand_list = json.loads(candidates)
+    try:
+        candidate_list = json.loads(candidates)
+    except json.JSONDecodeError as exc:
+        return fastapi.responses.JSONResponse(
+            content={'ok': False, 'error': f'Invalid candidates JSON: {exc}'},
+            status_code=400,
+        )
 
-        if not query_bytes or not isinstance(cand_list, list) or not cand_list:
-            return fastapi.responses.JSONResponse(
-                content={'ok': False, 'error': 'image and candidates are required'},
-                status_code=400,
+    orb = cv2.ORB_create(ORB_MAX_FEATURES)
+    query_u8 = query_arr.astype(np.uint8)
+    _, query_desc = orb.detectAndCompute(query_u8, None)
+
+    results = []
+
+    for item in candidate_list:
+        record_id = item.get('record_id', '')
+        logo_url = item.get('logo_url', '')
+
+        if not logo_url or not str(logo_url).startswith('http'):
+            results.append({
+                'record_id': record_id,
+                'usable': False,
+                'ssim_score': None,
+                'orb_score': None,
+                'error': 'missing_or_invalid_logo_url',
+            })
+            continue
+
+        try:
+            req = urllib.request.Request(
+                logo_url,
+                headers={'User-Agent': 'SimilarityAssist/1.0'},
             )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                cand_bytes = resp.read()
 
-        # Clamp top_k
-        top_k = max(1, min(int(top_k or 30), 60))
-        use_orb = bool(use_orb)
+            cand_arr = _prepare(cand_bytes)
+            cand_u8 = cand_arr.astype(np.uint8)
 
-        # Precompute query grays
-        q_gray_64 = _load_gray(query_bytes, 64)
-        q_gray_256 = _load_gray(query_bytes, 256) if use_orb else None
+            # SSIM
+            C1, C2 = 6.5025, 58.5225
+            mu_q = cv2.GaussianBlur(query_arr, (11, 11), 1.5)
+            mu_c = cv2.GaussianBlur(cand_arr, (11, 11), 1.5)
 
-        # Limit candidates
-        cand_list = cand_list[:top_k]
+            mu_q2 = mu_q * mu_q
+            mu_c2 = mu_c * mu_c
+            mu_qc = mu_q * mu_c
 
-        def work(c: dict):
-            rid = str(c.get('record_id', '') or '')
-            url = str(c.get('logo_url', '') or '')
-            if not rid or not url:
-                return {'record_id': rid, 'ssim_score': 0.0, 'orb_score': 0.0, 'error': 'missing record_id or logo_url'}
-            try:
-                img_bytes = _fetch_url_bytes(url, timeout=12)
-                c_gray_64 = _load_gray(img_bytes, 64)
-                ssim = _ssim_score(q_gray_64, c_gray_64)
-                orb = 0.0
-                if use_orb and q_gray_256 is not None:
-                    c_gray_256 = _load_gray(img_bytes, 256)
-                    orb = _orb_score(q_gray_256, c_gray_256)
-                return {'record_id': rid, 'ssim_score': ssim, 'orb_score': orb}
-            except Exception as exc:
-                return {'record_id': rid, 'ssim_score': 0.0, 'orb_score': 0.0, 'error': str(exc)}
+            sig_q2 = cv2.GaussianBlur(query_arr * query_arr, (11, 11), 1.5) - mu_q2
+            sig_c2 = cv2.GaussianBlur(cand_arr * cand_arr, (11, 11), 1.5) - mu_c2
+            sig_qc = cv2.GaussianBlur(query_arr * cand_arr, (11, 11), 1.5) - mu_qc
 
-        results = []
-        max_workers = int(os.environ.get('RERANK_WORKERS', '6'))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            for out in ex.map(work, cand_list):
-                results.append(out)
+            num = (2 * mu_qc + C1) * (2 * sig_qc + C2)
+            den = (mu_q2 + mu_c2 + C1) * (sig_q2 + sig_c2 + C2)
+            ssim_map = num / (den + 1e-10)
+            ssim_score = float(np.clip(ssim_map.mean(), 0.0, 1.0))
 
-        return fastapi.responses.JSONResponse(content={'ok': True, 'results': results})
+            # ORB
+            orb_score = None
+            if query_desc is not None and len(query_desc) > 0:
+                _, cand_desc = orb.detectAndCompute(cand_u8, None)
+                if cand_desc is not None and len(cand_desc) > 0:
+                    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+                    raw_matches = bf.knnMatch(query_desc, cand_desc, k=2)
+                    good = []
+                    for pair in raw_matches:
+                        if len(pair) == 2:
+                            m, n = pair
+                            if m.distance < ORB_MATCH_RATIO * n.distance:
+                                good.append(m)
 
+                    max_possible = min(len(query_desc), len(cand_desc))
+                    if max_possible > 0:
+                        orb_score = float(np.clip(len(good) / max_possible, 0.0, 1.0))
+
+            usable = True
+            results.append({
+                'record_id': record_id,
+                'usable': usable,
+                'ssim_score': ssim_score,
+                'orb_score': orb_score,
+            })
+
+        except Exception as exc:
+            results.append({
+                'record_id': record_id,
+                'usable': False,
+                'ssim_score': None,
+                'orb_score': None,
+                'error': str(exc),
+            })
+
+    return fastapi.responses.JSONResponse(content={'ok': True, 'results': results})
+    
     except Exception as exc:
         return fastapi.responses.JSONResponse(
             content={'ok': False, 'error': str(exc)},
