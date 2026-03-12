@@ -751,156 +751,276 @@ async def reprocess_from_url(body: dict):
         )
 
 
-@app.post('/rerank')
+
+def _safe_read_url_bytes(url: str, timeout: int = 15) -> bytes:
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "SimilarityAssist/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _prepare_logo_variants(img_bytes: bytes, thumb_size=(192, 192)):
+    """
+    Returns:
+      full_arr: grayscale logo centered in white square
+      crop_arr: whitespace-trimmed grayscale logo centered in white square
+      edge_arr: edge map for shape/structure comparison
+    """
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+
+    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    bg.paste(img, mask=img.split()[3] if img.mode == "RGBA" else None)
+
+    gray = bg.convert("L")
+    arr = np.array(gray)
+
+    mask = arr < 245
+    if mask.any():
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+        r0, r1 = np.where(rows)[0][[0, -1]]
+        c0, c1 = np.where(cols)[0][[0, -1]]
+
+        pad_r = max(2, int((r1 - r0 + 1) * 0.06))
+        pad_c = max(2, int((c1 - c0 + 1) * 0.06))
+
+        r0 = max(0, r0 - pad_r)
+        r1 = min(arr.shape[0] - 1, r1 + pad_r)
+        c0 = max(0, c0 - pad_c)
+        c1 = min(arr.shape[1] - 1, c1 + pad_c)
+
+        cropped = gray.crop((c0, r0, c1 + 1, r1 + 1))
+    else:
+        cropped = gray
+
+    full_contained = ImageOps.contain(gray, thumb_size, Image.Resampling.LANCZOS)
+    full_canvas = Image.new("L", thumb_size, 255)
+    fx = (thumb_size[0] - full_contained.size[0]) // 2
+    fy = (thumb_size[1] - full_contained.size[1]) // 2
+    full_canvas.paste(full_contained, (fx, fy))
+
+    crop_contained = ImageOps.contain(cropped, thumb_size, Image.Resampling.LANCZOS)
+    crop_canvas = Image.new("L", thumb_size, 255)
+    cx = (thumb_size[0] - crop_contained.size[0]) // 2
+    cy = (thumb_size[1] - crop_contained.size[1]) // 2
+    crop_canvas.paste(crop_contained, (cx, cy))
+
+    full_arr = np.array(full_canvas, dtype=np.float32)
+    crop_arr = np.array(crop_canvas, dtype=np.float32)
+
+    edge_arr = cv2.Canny(crop_arr.astype(np.uint8), 80, 160)
+
+    return full_arr, crop_arr, edge_arr
+
+
+def _ssim_score(a: np.ndarray, b: np.ndarray) -> float:
+    C1, C2 = 6.5025, 58.5225
+
+    mu_a = cv2.GaussianBlur(a, (11, 11), 1.5)
+    mu_b = cv2.GaussianBlur(b, (11, 11), 1.5)
+
+    mu_a2 = mu_a * mu_a
+    mu_b2 = mu_b * mu_b
+    mu_ab = mu_a * mu_b
+
+    sigma_a2 = cv2.GaussianBlur(a * a, (11, 11), 1.5) - mu_a2
+    sigma_b2 = cv2.GaussianBlur(b * b, (11, 11), 1.5) - mu_b2
+    sigma_ab = cv2.GaussianBlur(a * b, (11, 11), 1.5) - mu_ab
+
+    num = (2 * mu_ab + C1) * (2 * sigma_ab + C2)
+    den = (mu_a2 + mu_b2 + C1) * (sigma_a2 + sigma_b2 + C2)
+
+    ssim_map = num / (den + 1e-10)
+    return float(np.clip(ssim_map.mean(), 0.0, 1.0))
+
+
+def _orb_similarity(query_u8: np.ndarray, cand_u8: np.ndarray):
+    orb = cv2.ORB_create(1200)
+    _, q_desc = orb.detectAndCompute(query_u8, None)
+    _, c_desc = orb.detectAndCompute(cand_u8, None)
+
+    if q_desc is None or c_desc is None or len(q_desc) == 0 or len(c_desc) == 0:
+        return None
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    raw_matches = bf.knnMatch(q_desc, c_desc, k=2)
+
+    good = []
+    for pair in raw_matches:
+        if len(pair) == 2:
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+
+    max_possible = min(len(q_desc), len(c_desc))
+    if max_possible <= 0:
+        return None
+
+    return float(np.clip(len(good) / max_possible, 0.0, 1.0))
+
+
+def _edge_overlap_score(edge_a: np.ndarray, edge_b: np.ndarray) -> float:
+    a = (edge_a > 0).astype(np.uint8)
+    b = (edge_b > 0).astype(np.uint8)
+
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+
+    if union == 0:
+        return 0.0
+
+    return float(np.clip(inter / union, 0.0, 1.0))
+
+
+def _visual_score(ssim_full, ssim_crop, orb_score, edge_score):
+    values = []
+
+    if ssim_full is not None:
+        values.append(("ssim_full", ssim_full))
+    if ssim_crop is not None:
+        values.append(("ssim_crop", ssim_crop))
+    if orb_score is not None:
+        values.append(("orb", orb_score))
+    if edge_score is not None:
+        values.append(("edge", edge_score))
+
+    if not values:
+        return None
+
+    weights = {
+        "ssim_full": 0.18,
+        "ssim_crop": 0.32,
+        "orb": 0.32,
+        "edge": 0.18,
+    }
+
+    total = 0.0
+    denom = 0.0
+    for name, v in values:
+        total += weights[name] * float(v)
+        denom += weights[name]
+
+    if denom <= 0:
+        return None
+
+    return float(np.clip(total / denom, 0.0, 1.0))
+
+
+
+@app.post("/rerank")
 async def rerank_candidates(
     image: UploadFile = File(...),
     candidates: str = Form(...),
 ):
     """
-    Visual reranker — AXIS 2.
+    Visual reranker.
 
-    Important behavior:
+    Important:
     - returns usable=False for invalid/unusable comparisons
-    - does NOT use 0/0 as fake evidence
-    - prepares logos in a whitespace-aware, aspect-preserving way
+    - does NOT use fake 0/0 scores as evidence
+    - compares both full normalized logo and trimmed-content logo
     """
     import json
-    import urllib.request
-
-    THUMB_SIZE = (160, 160)
-    ORB_MAX_FEATURES = 1200
-    ORB_MATCH_RATIO = 0.75
-
-    def _prepare(img_bytes: bytes) -> np.ndarray:
-        img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
-
-        bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
-        bg.paste(img, mask=img.split()[3] if img.mode == 'RGBA' else None)
-        gray = bg.convert('L')
-
-        arr = np.array(gray)
-        mask = arr < 245
-        if mask.any():
-            rows = np.any(mask, axis=1)
-            cols = np.any(mask, axis=0)
-            r0, r1 = np.where(rows)[0][[0, -1]]
-            c0, c1 = np.where(cols)[0][[0, -1]]
-
-            pad_r = max(2, int((r1 - r0 + 1) * 0.06))
-            pad_c = max(2, int((c1 - c0 + 1) * 0.06))
-
-            r0 = max(0, r0 - pad_r)
-            r1 = min(arr.shape[0] - 1, r1 + pad_r)
-            c0 = max(0, c0 - pad_c)
-            c1 = min(arr.shape[1] - 1, c1 + pad_c)
-
-            gray = gray.crop((c0, r0, c1 + 1, r1 + 1))
-
-        contained = ImageOps.contain(gray, THUMB_SIZE, Image.Resampling.LANCZOS)
-        canvas = Image.new('L', THUMB_SIZE, 255)
-        x = (THUMB_SIZE[0] - contained.size[0]) // 2
-        y = (THUMB_SIZE[1] - contained.size[1]) // 2
-        canvas.paste(contained, (x, y))
-
-        return np.array(canvas, dtype=np.float32)
-
-    query_bytes = await image.read()
-    try:
-        query_arr = _prepare(query_bytes)
-    except Exception as exc:
-        return fastapi.responses.JSONResponse(
-            content={'ok': False, 'error': f'Cannot decode query image: {exc}'},
-            status_code=400,
-        )
+    import urllib.error
 
     try:
         candidate_list = json.loads(candidates)
     except json.JSONDecodeError as exc:
         return fastapi.responses.JSONResponse(
-            content={'ok': False, 'error': f'Invalid candidates JSON: {exc}'},
+            content={"ok": False, "error": f"Invalid candidates JSON: {exc}"},
             status_code=400,
         )
 
-    orb = cv2.ORB_create(ORB_MAX_FEATURES)
-    query_u8 = query_arr.astype(np.uint8)
-    _, query_desc = orb.detectAndCompute(query_u8, None)
+    query_bytes = await image.read()
+
+    try:
+        q_full, q_crop, q_edge = _prepare_logo_variants(query_bytes)
+    except Exception as exc:
+        return fastapi.responses.JSONResponse(
+            content={"ok": False, "error": f"Cannot decode query image: {exc}"},
+            status_code=400,
+        )
 
     results = []
 
     for item in candidate_list:
-        record_id = item.get('record_id', '')
-        logo_url = item.get('logo_url', '')
+        record_id = item.get("record_id", "")
+        logo_url = item.get("logo_url", "")
 
-        if not logo_url or not str(logo_url).startswith('http'):
+        if not logo_url or not str(logo_url).startswith("http"):
             results.append({
-                'record_id': record_id,
-                'usable': False,
-                'ssim_score': None,
-                'orb_score': None,
-                'error': 'missing_or_invalid_logo_url',
+                "record_id": record_id,
+                "usable": False,
+                "ssim_score": None,
+                "orb_score": None,
+                "edge_score": None,
+                "visual_score": None,
+                "error": "missing_or_invalid_logo_url",
             })
             continue
 
         try:
-            req = urllib.request.Request(
-                logo_url,
-                headers={'User-Agent': 'SimilarityAssist/1.0'},
+            cand_bytes = _safe_read_url_bytes(logo_url, timeout=15)
+            c_full, c_crop, c_edge = _prepare_logo_variants(cand_bytes)
+
+            ssim_full = _ssim_score(q_full, c_full)
+            ssim_crop = _ssim_score(q_crop, c_crop)
+
+            orb_score = _orb_similarity(
+                q_crop.astype(np.uint8),
+                c_crop.astype(np.uint8),
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                cand_bytes = resp.read()
 
-            cand_arr = _prepare(cand_bytes)
-            cand_u8 = cand_arr.astype(np.uint8)
+            edge_score = _edge_overlap_score(q_edge, c_edge)
 
-            C1, C2 = 6.5025, 58.5225
-            mu_q = cv2.GaussianBlur(query_arr, (11, 11), 1.5)
-            mu_c = cv2.GaussianBlur(cand_arr, (11, 11), 1.5)
+            visual_score = _visual_score(
+                ssim_full=ssim_full,
+                ssim_crop=ssim_crop,
+                orb_score=orb_score,
+                edge_score=edge_score,
+            )
 
-            mu_q2 = mu_q * mu_q
-            mu_c2 = mu_c * mu_c
-            mu_qc = mu_q * mu_c
-
-            sig_q2 = cv2.GaussianBlur(query_arr * query_arr, (11, 11), 1.5) - mu_q2
-            sig_c2 = cv2.GaussianBlur(cand_arr * cand_arr, (11, 11), 1.5) - mu_c2
-            sig_qc = cv2.GaussianBlur(query_arr * cand_arr, (11, 11), 1.5) - mu_qc
-
-            num = (2 * mu_qc + C1) * (2 * sig_qc + C2)
-            den = (mu_q2 + mu_c2 + C1) * (sig_q2 + sig_c2 + C2)
-            ssim_map = num / (den + 1e-10)
-            ssim_score = float(np.clip(ssim_map.mean(), 0.0, 1.0))
-
-            orb_score = None
-            if query_desc is not None and len(query_desc) > 0:
-                _, cand_desc = orb.detectAndCompute(cand_u8, None)
-                if cand_desc is not None and len(cand_desc) > 0:
-                    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-                    raw_matches = bf.knnMatch(query_desc, cand_desc, k=2)
-                    good = []
-                    for pair in raw_matches:
-                        if len(pair) == 2:
-                            m, n = pair
-                            if m.distance < ORB_MATCH_RATIO * n.distance:
-                                good.append(m)
-
-                    max_possible = min(len(query_desc), len(cand_desc))
-                    if max_possible > 0:
-                        orb_score = float(np.clip(len(good) / max_possible, 0.0, 1.0))
+            usable = visual_score is not None
 
             results.append({
-                'record_id': record_id,
-                'usable': True,
-                'ssim_score': ssim_score,
-                'orb_score': orb_score,
+                "record_id": record_id,
+                "usable": usable,
+                "ssim_score": ssim_crop,
+                "orb_score": orb_score,
+                "edge_score": edge_score,
+                "visual_score": visual_score,
             })
 
+        except urllib.error.HTTPError as exc:
+            results.append({
+                "record_id": record_id,
+                "usable": False,
+                "ssim_score": None,
+                "orb_score": None,
+                "edge_score": None,
+                "visual_score": None,
+                "error": f"http_error_{exc.code}",
+            })
         except Exception as exc:
             results.append({
-                'record_id': record_id,
-                'usable': False,
-                'ssim_score': None,
-                'orb_score': None,
-                'error': str(exc),
+                "record_id": record_id,
+                "usable": False,
+                "ssim_score": None,
+                "orb_score": None,
+                "edge_score": None,
+                "visual_score": None,
+                "error": str(exc),
             })
 
-    return fastapi.responses.JSONResponse(content={'ok': True, 'results': results})
+    return fastapi.responses.JSONResponse(
+        content={
+            "ok": True,
+            "results": results,
+        }
+    )
+
 
