@@ -313,21 +313,34 @@ def build_visual_tags(row: dict, keyword_count: int) -> List[str]:
     return tags
 
 
+def _normalized_token_length(token: str) -> int:
+    token = normalize_latin_token(token) or clean_token(token)
+    return len(token or '')
+
+
+def is_likely_single_wordmark(keywords: List[str], conf: float) -> bool:
+    cleaned = [k for k in (keywords or []) if clean_token(k)]
+    if len(cleaned) != 1:
+        return False
+    longest = _normalized_token_length(cleaned[0])
+    return longest >= 5 and conf >= 40
+
+
 def build_text_presence_level(keywords: List[str], conf: float) -> str:
-    keyword_count = len(keywords)
+    keyword_count = len(keywords or [])
     if keyword_count == 0:
         return 'none'
 
-    longest_token = max((len(normalize_latin_token(k) or k) for k in keywords), default=0)
+    longest = max((_normalized_token_length(k) for k in (keywords or [])), default=0)
+    total_len = sum(_normalized_token_length(k) for k in (keywords or []))
 
-    # Stylized wordmarks often produce a single strong OCR token.
-    # Treat them as medium text presence so text-aware ranking does not get
-    # suppressed into the purely visual lane.
-    if keyword_count == 1 and longest_token >= 5 and conf >= 50:
+    if is_likely_single_wordmark(keywords, conf):
+        if conf >= 72 or longest >= 8:
+            return 'high'
         return 'medium'
 
-    if keyword_count == 2 and longest_token >= 4 and conf >= 45:
-        return 'medium'
+    if keyword_count == 2 and total_len >= 8 and conf >= 45:
+        return 'high' if conf >= 72 else 'medium'
 
     if keyword_count <= 2 or conf < 45:
         return 'low'
