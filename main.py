@@ -11,10 +11,13 @@ import io
 import os
 import re
 import tempfile
-import base64
 import unicodedata
+import ipaddress
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Iterable, List, Tuple
-from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import fastapi
@@ -22,9 +25,8 @@ import fastapi.middleware.cors
 import fastapi.responses
 import numpy as np
 import pytesseract
-import requests
 from fastapi import File, Form, UploadFile
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pytesseract import Output
 
 # ---------------------------------------------------------------------------
@@ -321,7 +323,14 @@ def build_text_presence_level(keyword_count: int, conf: float) -> str:
     return 'high'
 
 
-def build_visual_description(row: dict, keywords: List[str], script_guess: str, conf: float) -> str:
+def build_visual_description(
+    row: dict,
+    keywords: List[str],
+    script_guess: str,
+    conf: float,
+    brand_hint_tokens: List[str] | None = None,
+    text_source_mode: str = 'none',
+) -> str:
     colors: List[str] = []
     for idx in [1, 2, 3]:
         hx  = row.get(f'dominant_color_{idx}_hex')
@@ -336,11 +345,13 @@ def build_visual_description(row: dict, keywords: List[str], script_guess: str, 
     aspect      = float(row.get('aspect_ratio') or 1)
     orientation = 'portrait-oriented' if aspect < 0.85 else 'landscape-oriented' if aspect > 1.15 else 'square or near-square'
     layout      = build_layout_type(row, len(keywords))
-    text_text   = (
-        'No reliable readable text was detected'
-        if not keywords
-        else f"Readable {(script_guess or 'mixed script').lower()} text includes {', '.join(keywords[:6])}"
-    )
+    if not keywords:
+        if brand_hint_tokens and text_source_mode == 'brand_fallback_only':
+            text_text = 'No reliable readable text was detected. Request metadata provided a brand hint: ' + ', '.join(brand_hint_tokens[:4])
+        else:
+            text_text = 'No reliable readable text was detected'
+    else:
+        text_text = f"Readable {(script_guess or 'mixed script').lower()} text includes {', '.join(keywords[:6])}"
     style_map = {
         'text-heavy-label':     'a dense packaging-style or label-style composition',
         'balanced-emblem':      'a balanced emblem-like composition',
@@ -362,43 +373,190 @@ def build_visual_description(row: dict, keywords: List[str], script_guess: str, 
     )
 
 
-def merged_keywords(ocr_words: List[str], brand_name: str) -> Tuple[List[str], str]:
+class InputValidationError(ValueError):
+    pass
+
+
+MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', str(10 * 1024 * 1024)))
+MAX_DOWNLOAD_BYTES = int(os.environ.get('MAX_DOWNLOAD_BYTES', str(MAX_UPLOAD_BYTES)))
+MAX_IMAGE_PIXELS = int(os.environ.get('MAX_IMAGE_PIXELS', '25000000'))
+ALLOWED_UPLOAD_CONTENT_TYPES = {
+    'image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/bmp', 'image/tiff', 'image/gif',
+}
+ALLOWED_IMAGE_FORMATS = {'PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF', 'GIF'}
+FETCH_USER_AGENT = os.environ.get('FETCH_USER_AGENT', 'SimilarityAssist/1.1')
+ALLOWED_FETCH_HOSTS = [h.strip().lower() for h in os.environ.get('ALLOWED_FETCH_HOSTS', '').split(',') if h.strip()]
+ALLOW_PRIVATE_NETWORK_FETCH = os.environ.get('ALLOW_PRIVATE_NETWORK_FETCH', '').lower() in {'1', 'true', 'yes'}
+
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+
+def merge_text_sources(ocr_words: List[str], brand_name: str) -> dict:
     source_tokens = [t for t in tokenize_source(brand_name) if len(t) > 1]
-    source_norm   = [normalize_latin_token(t) for t in source_tokens]
-    good_ocr: List[str] = []
-    overlap = 0
+    source_norm = [normalize_latin_token(t) for t in source_tokens]
+
+    unique_ocr: List[str] = []
+    overlap_tokens: List[str] = []
+
     for tok in ocr_words:
-        sc   = guess_script(tok)
+        sc = guess_script(tok)
         keep = len(tok) > 1 or sc not in ('', 'Latin')
-        if keep:
-            good_ocr.append(tok)
+        if not keep:
+            continue
+        if tok not in unique_ocr:
+            unique_ocr.append(tok)
+
         nt = normalize_latin_token(tok)
         if nt and any(nt == s or nt in s or s in nt for s in source_norm if s):
-            overlap += 1
-    if source_tokens:
-        if overlap >= 1:
-            merged: List[str] = []
-            for tok in good_ocr:
-                nt = normalize_latin_token(tok)
-                if guess_script(tok) != 'Latin' or any(nt == s or nt in s or s in nt for s in source_norm if s):
-                    if tok not in merged:
-                        merged.append(tok)
-            for tok in source_tokens:
-                if tok not in merged:
-                    merged.append(tok)
-            return merged[:20], 'ocr_plus_brand_fallback'
-        if len(good_ocr) >= 3 and sum(len(t) for t in good_ocr) / max(len(good_ocr), 1) >= 4:
-            uniq: List[str] = []
-            for tok in good_ocr:
-                if tok not in uniq:
-                    uniq.append(tok)
-            return uniq[:20], 'ocr_only'
-        return source_tokens[:20], 'brand_fallback_only'
-    uniq = []
-    for tok in good_ocr:
-        if tok not in uniq:
-            uniq.append(tok)
-    return uniq[:20], 'ocr_only'
+            if tok not in overlap_tokens:
+                overlap_tokens.append(tok)
+
+    if unique_ocr and source_tokens:
+        mode = 'ocr_plus_brand_fallback' if overlap_tokens else 'ocr_only'
+    elif unique_ocr:
+        mode = 'ocr_only'
+    elif source_tokens:
+        mode = 'brand_fallback_only'
+    else:
+        mode = 'none'
+
+    return {
+        'ocr_keywords': unique_ocr[:20],
+        'brand_name_input_tokens': source_tokens[:20],
+        'brand_name_overlap_keywords': overlap_tokens[:20],
+        'text_source_mode': mode,
+    }
+
+
+def _safe_filename(name: str) -> str:
+    raw = os.path.basename(str(name or 'image'))
+    return raw or 'image'
+
+
+def _validate_upload_content_type(upload: UploadFile) -> None:
+    content_type = (upload.content_type or '').lower().strip()
+    if content_type and content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
+        raise InputValidationError(f'Unsupported content type: {content_type}')
+
+
+def _validate_image_bytes(image_bytes: bytes, filename: str = 'image') -> tuple[int, int, str]:
+    if not image_bytes:
+        raise InputValidationError('Empty image payload')
+    if len(image_bytes) > MAX_UPLOAD_BYTES:
+        raise InputValidationError(f'Image is too large ({len(image_bytes)} bytes). Max allowed is {MAX_UPLOAD_BYTES} bytes')
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as probe:
+            image_format = (probe.format or '').upper()
+            probe = ImageOps.exif_transpose(probe)
+            probe.load()
+            width, height = probe.size
+    except Image.DecompressionBombError as exc:
+        raise InputValidationError(f'Image exceeds safe pixel limit: {exc}') from exc
+    except UnidentifiedImageError as exc:
+        raise InputValidationError(f'Unsupported or corrupted image: {filename}') from exc
+    except Exception as exc:
+        raise InputValidationError(f'Cannot decode image {filename}: {exc}') from exc
+
+    if image_format not in ALLOWED_IMAGE_FORMATS:
+        raise InputValidationError(f'Unsupported image format: {image_format or "unknown"}')
+    if width <= 0 or height <= 0:
+        raise InputValidationError('Invalid image dimensions')
+    if width * height > MAX_IMAGE_PIXELS:
+        raise InputValidationError(f'Image dimensions exceed safe pixel limit ({MAX_IMAGE_PIXELS} pixels)')
+
+    return width, height, image_format
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or
+        ip.is_reserved or ip.is_unspecified
+    )
+
+
+def _is_allowed_host(hostname: str) -> None:
+    host = (hostname or '').strip().lower().rstrip('.')
+    if not host:
+        raise InputValidationError('Missing remote hostname')
+    if host in {'localhost', 'localhost.localdomain'}:
+        raise InputValidationError('Localhost fetch is not allowed')
+
+    if ALLOWED_FETCH_HOSTS:
+        if not any(host == allowed or host.endswith('.' + allowed) for allowed in ALLOWED_FETCH_HOSTS):
+            raise InputValidationError(f'Host not allowed for remote fetch: {host}')
+
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise InputValidationError(f'Cannot resolve remote host: {host}') from exc
+
+    resolved_ips = {info[4][0] for info in infos if info and info[4]}
+    if not resolved_ips:
+        raise InputValidationError(f'Cannot resolve remote host: {host}')
+
+    if not ALLOW_PRIVATE_NETWORK_FETCH:
+        for ip_str in resolved_ips:
+            if not _is_public_ip(ip_str):
+                raise InputValidationError(f'Remote host resolves to a private or restricted address: {host}')
+
+
+def _validate_remote_url(url: str) -> urllib.parse.ParseResult:
+    parsed = urllib.parse.urlparse(str(url or '').strip())
+    if parsed.scheme not in {'http', 'https'}:
+        raise InputValidationError('Remote URL must use http or https')
+    if parsed.username or parsed.password:
+        raise InputValidationError('Remote URL credentials are not allowed')
+    _is_allowed_host(parsed.hostname or '')
+    return parsed
+
+
+def _read_limited_response(resp, limit_bytes: int) -> bytes:
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(64 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit_bytes:
+            raise InputValidationError(f'Remote file exceeds max allowed size ({limit_bytes} bytes)')
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+
+def _safe_read_url_bytes(url: str, timeout: int = 15, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes:
+    parsed = _validate_remote_url(url)
+    req = urllib.request.Request(
+        parsed.geturl(),
+        headers={'User-Agent': FETCH_USER_AGENT},
+        method='GET',
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content_type = (resp.headers.get_content_type() or '').lower()
+            if content_type and content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
+                raise InputValidationError(f'Unsupported remote content type: {content_type}')
+            content_length = resp.headers.get('Content-Length')
+            if content_length:
+                try:
+                    if int(content_length) > max_bytes:
+                        raise InputValidationError(f'Remote file exceeds max allowed size ({max_bytes} bytes)')
+                except ValueError:
+                    pass
+            data = _read_limited_response(resp, max_bytes)
+    except urllib.error.HTTPError as exc:
+        raise exc
+    except urllib.error.URLError as exc:
+        raise InputValidationError(f'Failed to fetch remote image: {exc.reason}') from exc
+
+    _validate_image_bytes(data, parsed.path or 'remote-image')
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +644,8 @@ def extract_full_features(
     ip_office:           str  = '',
     ocr_enabled:         bool = True,
 ) -> dict:
+    _validate_image_bytes(image_bytes, logo_filename or 'logo')
+
     with tempfile.NamedTemporaryFile(
         suffix=os.path.splitext(logo_filename)[1] or '.png',
         delete=False,
@@ -509,15 +669,26 @@ def extract_full_features(
             except Exception as exc:
                 ocr_error = str(exc)[:250]
 
-        kws, mode     = merged_keywords(words, brand_name_original)
+        text_meta = merge_text_sources(words, brand_name_original)
+        kws = text_meta['ocr_keywords']
+        brand_hint_tokens = text_meta['brand_name_input_tokens']
+        brand_overlap_keywords = text_meta['brand_name_overlap_keywords']
+        mode = text_meta['text_source_mode']
         keyword_count = len(kws)
-        script        = guess_script(' '.join(kws if kws else words))
-        conf_float    = float(conf_mean) if conf_mean != '' else 0.0
+        script = guess_script(' '.join(kws if kws else words))
+        conf_float = float(conf_mean) if conf_mean != '' else 0.0
 
-        layout      = build_layout_type(base_row, keyword_count)
-        tags        = build_visual_tags(base_row, keyword_count)
-        description = build_visual_description(base_row, kws, script, conf_float)
-        presence    = build_text_presence_level(keyword_count, conf_float)
+        layout = build_layout_type(base_row, keyword_count)
+        tags = build_visual_tags(base_row, keyword_count)
+        description = build_visual_description(
+            base_row,
+            kws,
+            script,
+            conf_float,
+            brand_hint_tokens=brand_hint_tokens,
+            text_source_mode=mode,
+        )
+        presence = build_text_presence_level(keyword_count, conf_float)
 
         return {
             'record_id':           record_id,
@@ -535,7 +706,9 @@ def extract_full_features(
             'visual_tags':         tags,
             'visual_description':  description,
             'ocr_error':           ocr_error,
-            'extraction_version':  'v2',
+            'brand_name_input_tokens': brand_hint_tokens,
+            'brand_name_overlap_keywords': brand_overlap_keywords,
+            'extraction_version':  'v2.1',
             **base_row,
         }
     finally:
@@ -543,89 +716,6 @@ def extract_full_features(
             os.unlink(tmp_path)
         except Exception:
             pass
-
-
-# ---------------------------------------------------------------------------
-# Visual reranking helpers (SSIM + ORB)
-# ---------------------------------------------------------------------------
-
-def _decode_b64_image(b64: str) -> bytes:
-    # supports raw base64 or data URLs
-    if not b64:
-        return b''
-    b64 = str(b64).strip()
-    if b64.startswith('data:') and ',' in b64:
-        b64 = b64.split(',', 1)[1]
-    return base64.b64decode(b64)
-
-
-def _load_gray(img_bytes: bytes, size: int) -> np.ndarray:
-    """Load bytes → grayscale uint8 resized to (size,size)."""
-    im = Image.open(io.BytesIO(img_bytes))
-    im = ImageOps.exif_transpose(im)
-    im = im.convert('RGB').resize((size, size), Image.Resampling.LANCZOS)
-    arr = np.array(im)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    return gray
-
-
-def _ssim_score(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Standard SSIM (mean SSIM over full image) using Gaussian window."""
-    # Ensure float64
-    img1 = img1.astype(np.float64)
-    img2 = img2.astype(np.float64)
-
-    # Constants (for 8-bit images)
-    L = 255.0
-    C1 = (0.01 * L) ** 2
-    C2 = (0.03 * L) ** 2
-
-    mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
-    mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
-
-    mu1_sq = mu1 * mu1
-    mu2_sq = mu2 * mu2
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = cv2.GaussianBlur(img1 * img1, (11, 11), 1.5) - mu1_sq
-    sigma2_sq = cv2.GaussianBlur(img2 * img2, (11, 11), 1.5) - mu2_sq
-    sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
-
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-    score = float(np.mean(ssim_map))
-    # clamp
-    if score < 0:
-        score = 0.0
-    if score > 1:
-        score = 1.0
-    return round(score, 6)
-
-
-def _orb_score(gray1: np.ndarray, gray2: np.ndarray) -> float:
-    """ORB keypoint matching score in [0,1]."""
-    orb = cv2.ORB_create(nfeatures=600)
-    kp1, des1 = orb.detectAndCompute(gray1, None)
-    kp2, des2 = orb.detectAndCompute(gray2, None)
-    if des1 is None or des2 is None or not kp1 or not kp2:
-        return 0.0
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des1, des2)
-    if not matches:
-        return 0.0
-    matches.sort(key=lambda m: m.distance)
-    # "good" matches threshold (tuned)
-    good = [m for m in matches if m.distance < 60]
-    denom = max(20, min(len(kp1), len(kp2)))
-    score = len(good) / float(denom)
-    if score > 1:
-        score = 1.0
-    return round(float(score), 6)
-
-
-def _fetch_url_bytes(url: str, timeout: int = 10) -> bytes:
-    resp = requests.get(url, timeout=timeout, headers={'User-Agent': 'SimilarityAssistExtractor/1.0'})
-    resp.raise_for_status()
-    return resp.content
 
 
 # ---------------------------------------------------------------------------
@@ -690,10 +780,11 @@ async def extract_features(
     ip_office:           str        = Form(''),
     ocr_enabled:         str        = Form('true'),
 ):
-    image_bytes = await image.read()
-    filename    = logo_filename or image.filename or 'logo.png'
-    do_ocr      = ocr_enabled.lower() != 'false'
+    filename = logo_filename or image.filename or 'logo.png'
+    do_ocr = ocr_enabled.lower() != 'false'
     try:
+        _validate_upload_content_type(image)
+        image_bytes = await image.read()
         features = extract_full_features(
             image_bytes=image_bytes,
             logo_filename=filename,
@@ -704,6 +795,11 @@ async def extract_features(
             ocr_enabled=do_ocr,
         )
         return fastapi.responses.JSONResponse(content={'features': features, 'ok': True})
+    except InputValidationError as exc:
+        return fastapi.responses.JSONResponse(
+            content={'ok': False, 'error': str(exc)},
+            status_code=400,
+        )
     except Exception as exc:
         return fastapi.responses.JSONResponse(
             content={'ok': False, 'error': str(exc)},
@@ -713,7 +809,6 @@ async def extract_features(
 
 @app.post('/reprocess')
 async def reprocess_from_url(body: dict):
-    import urllib.request
     image_url:           str  = body.get('image_url', '')
     record_id:           str  = body.get('record_id', '')
     logo_filename:       str  = body.get('logo_filename', '')
@@ -727,16 +822,10 @@ async def reprocess_from_url(body: dict):
             status_code=400,
         )
     try:
-        blob_token = os.environ.get('BLOB_READ_WRITE_TOKEN', '')
-        req = urllib.request.Request(
-            image_url,
-            headers={'Authorization': f'Bearer {blob_token}'} if blob_token else {},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            image_bytes = resp.read()
+        image_bytes = _safe_read_url_bytes(image_url, timeout=30)
         features = extract_full_features(
             image_bytes=image_bytes,
-            logo_filename=logo_filename or os.path.basename(image_url),
+            logo_filename=logo_filename or _safe_filename(image_url),
             record_id=record_id,
             logo_url=logo_url,
             brand_name_original=brand_name_original,
@@ -744,23 +833,21 @@ async def reprocess_from_url(body: dict):
             ocr_enabled=do_ocr,
         )
         return fastapi.responses.JSONResponse(content={'features': features, 'ok': True})
+    except InputValidationError as exc:
+        return fastapi.responses.JSONResponse(
+            content={'ok': False, 'error': str(exc)},
+            status_code=400,
+        )
+    except urllib.error.HTTPError as exc:
+        return fastapi.responses.JSONResponse(
+            content={'ok': False, 'error': f'http_error_{exc.code}'},
+            status_code=502,
+        )
     except Exception as exc:
         return fastapi.responses.JSONResponse(
             content={'ok': False, 'error': str(exc)},
             status_code=500,
         )
-
-
-
-def _safe_read_url_bytes(url: str, timeout: int = 15) -> bytes:
-    import urllib.request
-
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "SimilarityAssist/1.0"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
 
 
 def _prepare_logo_variants(img_bytes: bytes, thumb_size=(192, 192)):
@@ -935,9 +1022,10 @@ async def rerank_candidates(
             status_code=400,
         )
 
-    query_bytes = await image.read()
-
     try:
+        _validate_upload_content_type(image)
+        query_bytes = await image.read()
+        _validate_image_bytes(query_bytes, image.filename or 'query.png')
         q_full, q_crop, q_edge = _prepare_logo_variants(query_bytes)
     except Exception as exc:
         return fastapi.responses.JSONResponse(
@@ -995,6 +1083,16 @@ async def rerank_candidates(
                 "visual_score": visual_score,
             })
 
+        except InputValidationError as exc:
+            results.append({
+                "record_id": record_id,
+                "usable": False,
+                "ssim_score": None,
+                "orb_score": None,
+                "edge_score": None,
+                "visual_score": None,
+                "error": str(exc),
+            })
         except urllib.error.HTTPError as exc:
             results.append({
                 "record_id": record_id,
