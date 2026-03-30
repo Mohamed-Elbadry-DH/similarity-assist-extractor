@@ -313,9 +313,22 @@ def build_visual_tags(row: dict, keyword_count: int) -> List[str]:
     return tags
 
 
-def build_text_presence_level(keyword_count: int, conf: float) -> str:
+def build_text_presence_level(keywords: List[str], conf: float) -> str:
+    keyword_count = len(keywords)
     if keyword_count == 0:
         return 'none'
+
+    longest_token = max((len(normalize_latin_token(k) or k) for k in keywords), default=0)
+
+    # Stylized wordmarks often produce a single strong OCR token.
+    # Treat them as medium text presence so text-aware ranking does not get
+    # suppressed into the purely visual lane.
+    if keyword_count == 1 and longest_token >= 5 and conf >= 50:
+        return 'medium'
+
+    if keyword_count == 2 and longest_token >= 4 and conf >= 45:
+        return 'medium'
+
     if keyword_count <= 2 or conf < 45:
         return 'low'
     if keyword_count <= 6 or conf < 70:
@@ -688,7 +701,7 @@ def extract_full_features(
             brand_hint_tokens=brand_hint_tokens,
             text_source_mode=mode,
         )
-        presence = build_text_presence_level(keyword_count, conf_float)
+        presence = build_text_presence_level(kws, conf_float)
 
         return {
             'record_id':           record_id,
