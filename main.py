@@ -334,13 +334,16 @@ def build_text_presence_level(keywords: List[str], conf: float) -> str:
     longest = max((_normalized_token_length(k) for k in (keywords or [])), default=0)
     total_len = sum(_normalized_token_length(k) for k in (keywords or []))
 
+    # Stylized single-word wordmarks (e.g. POLARIS) often OCR as just one token.
+    # They should not be downgraded to 'low' automatically when confidence is decent.
     if is_likely_single_wordmark(keywords, conf):
         if conf >= 72 or longest >= 8:
             return 'high'
         return 'medium'
 
+    # Two-token wordmarks can still be clearly text-led when OCR is readable enough.
     if keyword_count == 2 and total_len >= 8 and conf >= 45:
-        return 'high' if conf >= 72 else 'medium'
+        return 'medium' if conf < 72 else 'high'
 
     if keyword_count <= 2 or conf < 45:
         return 'low'
